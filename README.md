@@ -14,8 +14,8 @@ PCF_cell_type_analysis.Rmd: All associated packages and scripts to use the assig
 2. Go to Automate → Show Script Editor
 3. Load and run the scripts cell_detection then cell_type_classification
 4. Save output of cell type assignments from each image with associated pixel measurements.  
-5. Open Rv4.4.3, install any necessary packages, load in the ouput measurement tables.
+5. Open R, install any necessary packages, load in the ouput measurement tables.
 6. Run the PCF_cell_type_analysis script for distance calculations. 
 
 ## Requirements
-QuPath v0.6+ and R v4.4.3
+QuPath v0.6+ and R v4.4+

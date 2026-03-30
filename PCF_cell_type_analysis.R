@@ -1,0 +1,524 @@
+library(dplyr)
+library(readr)
+library(stringr)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+library(tidyverse)
+library(ggnewscale)
+library(circlize)
+library(ggpubr)
+library(patchwork)
+library(cowplot)
+library(grid)
+library(SPIAT)
+library(SingleCellExperiment)
+library(SpatialExperiment)
+
+
+##Set up data input, set folder containing all QuPath exports
+data_dir <- "QuPath_outputs"  
+
+# List all CSVs
+csv_files <- list.files(data_dir, pattern = "\\_flag.csv$", full.names = TRUE)
+
+# Read all CSVs and combine into one dataframe
+all_cells <- csv_files %>%
+  map_df(~ read_csv(.x, col_types = cols()))
+
+#Examine
+dim(all_cells)
+
+names(all_cells) <- str_replace_all(names(all_cells), "-", "_")
+names(all_cells) <- str_replace_all(names(all_cells), "/", "_")
+
+all_cells$Unique_ID <- paste(
+  all_cells$Sample,
+  all_cells$Cell_ID,
+  sep = "_"
+)
+
+any(duplicated(all_cells$Unique_ID))
+
+#Define cell type based on marker expression
+all_cells <- all_cells %>%
+  mutate(
+    Epithelial_cell = Pan_Cytokeratin_flag == 1,
+    Immune_cell = CD45_flag == 1 & Pan_Cytokeratin_flag == 0,
+    Tcell = Immune_cell & CD3e_flag == 1,
+    CD4_Tcell = Tcell & CD4_flag == 1 & CD8_flag == 0,
+    CD8_Tcell = Tcell & CD8_flag == 1 & CD4_flag == 0,
+    CD4_CD8_Tcell = Tcell & CD8_flag == 1 & CD4_flag == 1,
+    Dendritic_cells = Immune_cell & CD11c_flag == 1 & 
+      (HLA_A_flag == 1 | HLA_DR_flag == 1) & 
+      CD14_flag == 0 & CD68_flag == 0,
+    Monocyte_Macrophage = Immune_cell & (CD14_flag == 1 | CD68_flag == 1) & 
+      CD11c_flag == 0,
+    #functional myeloid subsets
+    Mac_TAM_CD206_CD163 = Monocyte_Macrophage &
+      (CD206_flag == 1 | CD163_flag == 1) & HLA_A_flag == 0 & HLA_DR_flag == 0,
+    Mac_APC_HLA = Monocyte_Macrophage & (HLA_A_flag == 1 | HLA_DR_flag == 1) & CD163_flag == 0 & CD206_flag == 0
+  )
+
+sample_map <- data.frame(
+  Sample = c("P1-P", "P2-P", "P14", "P8", "P11", "P12"),
+  group = c("BCG_unresponsive", "BCG_unresponsive", "BCG_unresponsive", "BCG_responsive", "BCG_responsive", "BCG_responsive"),
+  stringsAsFactors = FALSE
+)
+
+all_cells$group <- sample_map$group[
+  match(all_cells$Sample, sample_map$Sample)
+]
+
+all_cells <- all_cells %>%
+  mutate(
+    Cell_Type = case_when(
+      Mac_TAM_CD206_CD163 ~ "TAM",
+      Mac_APC_HLA ~ "APC_Macs",
+      Dendritic_cells ~ "Dendritic_cells",
+      Monocyte_Macrophage ~ "Monocyte_Macrophage",
+      CD4_Tcell ~ "CD4_Tcells",
+      CD8_Tcell ~ "CD8_Tcells",
+      Tcell ~ "Tcell",
+      Immune_cell ~ "Immune_cells",
+      Epithelial_cell ~ "Epithelial_cells",
+      TRUE ~ "Other_DAPI_cells"
+    )
+  )
+
+all_cells$Cell_Type <- as.factor(all_cells$Cell_Type)
+
+#Set up spatial experiment objects with SPIAT
+sample_list <- split(all_cells, all_cells$Sample)
+
+spe_list <- lapply(sample_list, function(df) {
+  
+  marker_cols <- grep("^Mean_", colnames(df), value = TRUE)
+  
+  intensity_matrix <- t(as.matrix(df[, marker_cols]))
+  rownames(intensity_matrix) <- gsub("^Mean_", "", marker_cols)
+  
+  df$Unique_Cell_ID <- paste(df$Sample, df$Cell_ID, sep = "_")
+  colnames(intensity_matrix) <- df$Unique_Cell_ID
+  
+  flag_cols <- grep("_flag$", colnames(df), value = TRUE)
+  marker_names <- gsub("_flag$", "", flag_cols)
+  
+  phenotypes <- apply(df[, flag_cols], 1, function(x) {
+    positive_markers <- marker_names[which(x == 1)]
+    if(length(positive_markers) == 0) "OTHER"
+    else paste(positive_markers, collapse = ",")
+  })
+  
+  spe <- format_image_to_spe(
+    format = "general",
+    intensity_matrix = intensity_matrix,
+    phenotypes = phenotypes,
+    coord_x = df$Centroid_X,
+    coord_y = df$Centroid_Y
+  )
+  
+  colData(spe)$Cell_ID <- df$Unique_Cell_ID
+  colData(spe)$Sample <- df$Sample
+  colData(spe)$ImageName <- df$Image
+  colData(spe)$Group <- df$group
+  
+  return(spe)
+})
+
+names(spe_list) <- names(sample_list)
+
+#Individual marker boxplot per sample, confirm marker expression with intensity boxplots
+for (sam in names(spe_list)) {
+  spe <- spe_list[[sam]]
+  markers <- rownames(assay(spe))
+  
+  # Create a list of plots
+  plot_list <- lapply(markers, function(marker) {
+    marker_intensity_boxplot(spe, marker)
+  })
+  
+  # Combine plots in a grid (patchwork)
+  combined_plot <- wrap_plots(plot_list, ncol = 2) # 2 columns
+  
+  ggsave(
+    filename = paste0("Marker_Boxplots_", sam, ".pdf"),
+    plot = combined_plot,
+    width = 12,
+    height = length(markers)/2*3  # adjust height to number of rows
+  )
+}
+
+#Correct the spatial coordinates, flip y axis because 0 is reoriented 
+for (sam in names(spe_list)) {
+  spe <- spe_list[[sam]]
+  
+  max_y <- max(spatialCoords(spe)[,2])
+  spatialCoords(spe)[,2] <- max_y - spatialCoords(spe)[,2]
+  
+  spe_list[[sam]] <- spe
+}
+
+#Plot cell type spatial distribution
+#Add in cell type info the spatial experiment objects
+for (sam in names(spe_list)) {
+  spe <- spe_list[[sam]]
+  
+  # Match cells in spe to your all_cells logic
+  df <- all_cells[all_cells$Sample == sam, ]
+  
+  # Combine into a single "Cell.Type" column (example: using highest-level categories)
+  # Here you can customize the hierarchy for plotting
+  cell_type <- rep("Other_DAPI_cells", nrow(df))
+  cell_type[df$Epithelial_cell] <- "Epithelial_cells"
+  cell_type[df$Immune_cell & !df$Tcell & !df$Monocyte_Macrophage & !df$Dendritic_cells] <- "CD45_Immune_cells"
+  cell_type[df$CD4_Tcell] <- "CD4_Tcells"
+  cell_type[df$CD8_Tcell] <- "CD8_Tcells"
+  cell_type[df$Mac_TAM_CD206_CD163] <- "TAM"
+  cell_type[df$Mac_APC_HLA] <- "APC_Macs"
+  cell_type[df$Dendritic_cells] <- "Dendritic_cells"
+  
+  colData(spe)$Cell.Type <- cell_type
+  
+  spe_list[[sam]] <- spe
+}
+
+all_cell_types <- c("Other_DAPI_cells", "Epithelial_cells", "CD45_Immune_cells",
+                    "M2_TAM", "M1_APC_Macs", "Dendritic_cells", "CD4_Tcells", "CD8_Tcells")
+
+# Assign a color to each cell type
+cell_type_colors <- c("Epithelial_cells" = "#C08A3E", 
+                      "CD4_Tcells" = "#f0be39", 
+                      "CD8_Tcells" = "#e46828",
+                      "TAM" = "#5344A9", 
+                      "APC_Macs" = "#3BC6A4", 
+                      "Dendritic_cells" = "#d34467", 
+                      "CD45_Immune_cells" = "#1f78b4", 
+                      "Other_DAPI_cells" = "lightgray")
+
+#Cell type tissue distribution plot
+for (sam in names(spe_list)) {
+  spe <- spe_list[[sam]]
+  
+  group_label <- unique(colData(spe)$Group)
+  
+  # Spatial coordinates
+  coords <- spatialCoords(spe)
+  
+  # Combine with cell metadata
+  df <- as.data.frame(colData(spe))
+  df$x <- coords[,1]   # X coordinate
+  df$y <- coords[,2]   # Y coordinate
+  
+  # Factor with consistent levels
+  df$Cell.Type <- factor(df$Cell.Type,
+                         levels = all_cell_types)
+  
+  df <- df[order(match(df$Cell.Type, levels(df$Cell.Type))), ]
+  
+  #Make the other cells less transparent
+  df$alpha_val <- ifelse(df$Cell.Type == "Other_DAPI_cells", 0.3, 0.8)
+  
+  # Keep only present categories
+  present_categories <- levels(df$Cell.Type)[
+    levels(df$Cell.Type) %in% df$Cell.Type
+  ]
+  present_colors <- cell_type_colors[present_categories]
+  
+  p <- ggplot(df, aes(x = x, y = y, color = Cell.Type, alpha = alpha_val)) +
+    geom_point(size = 0.5, stroke = 0) +
+    scale_alpha_identity() +
+    scale_color_manual(values = present_colors,
+                       labels = present_categories,
+                       name = "Cell Type") +
+    labs(title = paste(sam, ":", group_label),
+         x = "X coordinate (µm)",
+         y = "Y coordinate (µm)") +
+    theme_classic() +
+    theme(
+      plot.title = element_text(size = 7, face = "bold", hjust = 0,
+                                margin = margin(b = 4, t = 0, l = 8)),
+      plot.title.position = "plot",
+      axis.title = element_text(size = 7),
+      axis.text = element_text(size = 7),
+      plot.margin = margin(2, 2, 2, 2),
+      legend.position = "none")
+  
+  p <- p +
+    coord_fixed(xlim = c(min(df$x) - 500, max(df$x) + 500),
+                ylim = c(min(df$y) - 500, max(df$y) + 500),
+                expand = FALSE)
+  
+  # Save spatial plot
+  ggsave(
+    filename = paste0("CellTypeSpatial_plot_", sam, ".png"),
+    plot = p,
+    width = 3.5,
+    height = 3.5,
+    units = "in",
+    dpi = 600)
+}
+
+#Distance calculations between cell types, set APC as reference compute distance to T cells
+APC_Tcell_distance_list <- list()
+
+for (sam in names(spe_list)) {
+  
+  spe <- spe_list[[sam]]
+  
+  dist_df <- calculate_minimum_distances_between_celltypes(
+    spe_object = spe,
+    feature_colname = "Cell.Type",
+    cell_types_of_interest = c("CD4_Tcells",
+                               "CD8_Tcells",
+                               "Dendritic_cells",
+                               "APC_Macs",
+                               "TAM")
+  )
+  
+  dist_df <- dist_df %>%
+    dplyr::filter(
+      RefType %in% c("Dendritic_cells",
+                     "APC_Macs",
+                     "TAM") &
+        NearestType %in% c("CD4_Tcells","CD8_Tcells")
+    ) %>%
+    mutate(
+      Sample = sam,
+      Group = unique(colData(spe)$Group)
+    )
+  
+  APC_Tcell_distance_list[[sam]] <- dist_df
+}
+
+# Combine all distances into one dataframe
+APC_Tcell_distances <- dplyr::bind_rows(APC_Tcell_distance_list)
+
+#All T cell to APC close distances
+APC_Tcell_close_distances <- APC_Tcell_distances %>%
+  dplyr::filter(Distance <= 50)
+
+APC_Tcell_close_distances$Group <- factor(APC_Tcell_close_distances$Group,
+                                          levels = c("BCG_unresponsive", "BCG_responsive"))
+
+APC_Tcell_close_distances$Sample <- factor(
+  APC_Tcell_close_distances$Sample,
+  levels = c("P8","P1-P","P11","P2-P","P12","P14"))
+
+sample_colors <- c("P8" =  "#8C6D62",
+                   "P11" = "#D6A77A",
+                   "P12" = "#C4A000",
+                   "P1-P" = "#009E73",
+                   "P2-P" = "#7FB3B8",
+                   "P14" = "#9F8FBF")
+
+DC_CD_plot_data <- APC_Tcell_close_distances %>%
+  filter(RefType == "Dendritic_cells") %>%
+  filter(NearestType == "CD4_Tcells")
+
+write.csv(DC_CD_plot_data, "DC_CD4_distance_all_samples.csv", row.names = FALSE)
+
+#Summary plot of DC to CD4 distances
+DC_density <- ggplot(DC_CD_plot_data, 
+                     aes(x = Distance,
+                         color = Sample,
+                         linetype = Group)) +
+  geom_density(size = 0.8) +
+  scale_color_manual(values = sample_colors, guide = "none") +
+  scale_linetype_manual(values = c("BCG_unresponsive" = "dashed",
+                                   "BCG_responsive" = "solid"),
+                        guide = "none") +
+  theme_classic() +
+  labs(x = "Minimum distance (µm)",
+       y = "Density",
+       title = "Proximity of CD4+ T cells → DCs") + 
+  scale_x_continuous(limits = c(0, NA), expand = c(0, 0.9)) +
+  theme(
+    plot.title = element_text(size = 7, face = "bold", hjust = 0,
+                              margin = margin(b = 4, t = 0, l = 8)),
+    plot.title.position = "plot",
+    axis.title = element_text(size = 7),
+    axis.text = element_text(size = 7),
+    legend.title = element_text(size = 7),
+    legend.text = element_text(size = 7),
+    plot.margin = margin(10, 2, 2, 2)
+  )
+
+TAM_CD4_plot_data <- APC_Tcell_close_distances %>%
+  filter(RefType == "TAM") %>%
+  filter(NearestType == "CD4_Tcells")
+
+write.csv(TAM_CD4_plot_data, "TAM_CD4_distance_all_samples.csv", row.names = FALSE)
+
+#Summary plot of TAM to CD4 distances
+TAM_density <- ggplot(TAM_CD4_plot_data, 
+                      aes(x = Distance,
+                          color = Sample,
+                          linetype = Group)) +
+  geom_density(size = 0.8) +
+  theme_classic() +
+  scale_color_manual(values = sample_colors, 
+                     guide = "none") +
+  scale_linetype_manual(values = c(
+    "BCG_unresponsive" = "dashed",
+    "BCG_responsive"   = "solid"),
+    guide = "none") +
+  labs(x = "Minimum distance (µm)",
+       y = "Density",
+       title = "Proximity of CD4+ T cells → TAMs")+ 
+  scale_x_continuous(limits = c(0, NA), expand = c(0, 0.9)) +
+  theme(
+    plot.title = element_text(size = 7, face = "bold", hjust = 0,
+                              margin = margin(b = 4, t = 0, l = 8)),
+    plot.title.position = "plot",
+    axis.title = element_text(size = 7),
+    axis.text = element_text(size = 7),
+    plot.margin = margin(10, 2, 2, 2)
+  )
+
+combined_density <- (DC_density / TAM_density) +
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.box = "horizontal"
+  )
+
+ggsave(
+  filename = "PCF_DC_TAM_Tcell_distance_split_BCG_density_plot_nolegend.png",
+  plot = combined_density,
+  width = 2.5,
+  height = 4,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+
+#Determine proportion of APC within close proximity to T cells
+#Use overall df, subset to only DC and CD4
+DC_CD4_distances <- APC_Tcell_distances %>%
+  filter(RefType == "Dendritic_cells") %>%
+  filter(NearestType == "CD4_Tcells")
+
+proximity_summary_DC <- DC_CD4_distances %>%
+  group_by(Sample,
+           Group,
+           RefType,
+           NearestType) %>%
+  summarise(
+    percent_close = mean(Distance <= 50) * 100,
+    .groups = "drop"
+  )
+
+write.csv(proximity_summary_DC, "DC_CD4_distance_proportion_summary_all_samples.csv", row.names = FALSE)
+
+proximity_summary_DC$Sample <- factor(
+  proximity_summary_DC$Sample,
+  levels = c("P8","P11","P12","P1-P","P2-P","P14"))
+
+boxplot_DC <- ggplot(proximity_summary_DC,
+                     aes(x = Group,
+                         y = percent_close,
+                         linetype = Group)) +
+  geom_boxplot(fill = NA, color = "black", alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(aes(color = Sample),
+              width = 0.25,
+              size = 3) +
+  scale_linetype_manual(values = c(
+    "BCG_unresponsive" = "dashed",
+    "BCG_responsive"   = "solid"),
+    guide = "none") +
+  scale_color_manual(values = sample_colors, guide = "none") +
+  theme_classic() + 
+  scale_x_discrete(labels = c("BCG_responsive" = "BCG_R",
+                              "BCG_unresponsive" = "BCG_UN")) + 
+  guides(
+    fill  = guide_legend(title = "Response", order = 1), 
+    shape = guide_legend(title = "Sample", order = 2)) +
+  expand_limits(y = 0) +
+  labs(title = "DCs within 50 µm of CD4+ T cells",
+       y = "Percent (%)",
+       x = "") +
+  theme(
+    plot.title = element_text(size = 7, face = "bold", hjust = 0,
+                              margin = margin(b = 4, t = 0, l = -6)),
+    plot.title.position = "plot",
+    axis.title = element_text(size = 7),
+    axis.text = element_text(size = 7),
+    legend.title = element_text(size = 7),
+    legend.text = element_text(size = 7),
+    plot.margin = margin(2, 2, 2, 2)
+  )
+
+TAM_CD4_distances <- APC_Tcell_distances %>%
+  filter(RefType == "TAM") %>%
+  filter(NearestType == "CD4_Tcells")
+
+proximity_summary_TAM <- TAM_CD4_distances %>%
+  group_by(Sample,
+           Group,
+           RefType,
+           NearestType) %>%
+  summarise(
+    percent_close = mean(Distance <= 50) * 100,
+    .groups = "drop"
+  )
+
+write.csv(proximity_summary_TAM, "TAM_CD4_distance_proportion_summary_all_samples.csv", row.names = FALSE)
+
+proximity_summary_TAM$Sample <- factor(
+  proximity_summary_TAM$Sample,
+  levels = c("P8","P11","P12","P1-P","P2-P","P14"))
+
+boxplot_TAM <- ggplot(proximity_summary_M2,
+                      aes(x = Group,
+                          y = percent_close,
+                          linetype = Group)) +
+  geom_boxplot(fill = NA, color = "black", alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(aes(color = Sample),
+              width = 0.25,
+              size = 3) +
+  scale_linetype_manual(values = c(
+    "BCG_unresponsive" = "dashed",
+    "BCG_responsive"   = "solid"),
+    guide = "none") +
+  scale_color_manual(values = sample_colors, guide = "none") +
+  theme_classic() + 
+  scale_x_discrete(labels = c("BCG_responsive" = "BCG_R",
+                              "BCG_unresponsive" = "BCG_UN")) + 
+  guides(
+    fill  = guide_legend(title = "Response", order = 1), 
+    shape = guide_legend(title = "Sample", order = 2)) +
+  expand_limits(y = 0) +
+  labs(title = "TAMs within 50 µm of CD4+ T cells",
+       y = "Percent (%)",
+       x = "") +
+  theme(
+    plot.title = element_text(size = 7, face = "bold", hjust = 0,
+                              margin = margin(b = 4, t = 0, l = -6)),
+    plot.title.position = "plot",
+    axis.title = element_text(size = 7),
+    axis.text = element_text(size = 7),
+    legend.title = element_text(size = 7),
+    legend.text = element_text(size = 7),
+    plot.margin = margin(2, 2, 2, 2)
+  )
+
+combined_percent <- (boxplot_DC / boxplot_TAM) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.box = "horizontal"
+  )
+
+ggsave(
+  filename = "PCF_DC_TAM_Tcell_distance_percent_split_BCG_boxplot.png",
+  plot = combined_percent,
+  width = 2.1,
+  height = 4.3,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+

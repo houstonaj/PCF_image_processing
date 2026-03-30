@@ -4,7 +4,9 @@ Custom scripts for spatial proteomics image processing in QuPath and R
 
 ## Scripts
 cell_detection.groovy: Uses a trained nuclei segmentation model to detect all DAPI-positive nuclei with approximated cell boundaries from an input PhenoCycler Fusion qptiff image. 
+
 cell_type_classification.groovy: Established single-classifier thresholds for cell type assignments based on marker positivity for a given input region. 
+
 PCF_cell_type_analysis.Rmd: All associated packages and scripts to use the assigned cell types and coordinates to perform distance calculations in R. 
 
 ## Usage

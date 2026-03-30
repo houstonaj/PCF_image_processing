@@ -7,7 +7,7 @@ cell_detection.groovy: Uses a trained nuclei segmentation model to detect all DA
 
 cell_type_classification.groovy: Established single-classifier thresholds for cell type assignments based on marker positivity for a given input region. 
 
-PCF_cell_type_analysis.Rmd: All associated packages and scripts to use the assigned cell types and coordinates to perform distance calculations in R. 
+PCF_cell_type_analysis.R: The associated packages and script to use the assigned cell types and coordinates to perform distance calculations and plots in R. 
 
 ## Usage
 1. Open QuPath and load in QPTIFF images.
